@@ -1,0 +1,63 @@
+# pod-crabbox-k3s-gpu — the NVIDIA-GPU k3s CachyOS lease image for the Crabbox
+# containerd provider.
+#
+# One repo per image (W5.2, opencharly/opencharly#869). The image imports the k3s
+# lease image at a PINNED tag, so the image tag and the git tag name the same
+# build: ghcr.io/opencharly/pod-crabbox-k3s-gpu:<tag> is the tree tagged <tag>.
+repo: github.com/opencharly/pod-crabbox-k3s-gpu
+defaults:
+    platform:
+        - linux/amd64
+    tag: auto
+    registry: ghcr.io/opencharly
+    build:
+        - pac
+import: []
+discover:
+    - path: candy
+      recursive: true
+
+# The GPU variant of the k3s image. The lease contract (sshd on 2222, the
+# `crabbox` login user with passwordless sudo, the read-only `/crabbox` inputs,
+# the shared bootstrap, the readiness hook), systemd-as-PID-1, the inner
+# containerd and the k3s control plane are all inherited from `pod-crabbox-k3s`;
+# this image adds the NVIDIA userspace, the toolkit's CDI refresh and the device
+# plugin that advertises `nvidia.com/gpu`.
+pod-crabbox-k3s-gpu:
+    candy:
+        description: |
+            The NVIDIA-GPU k3s CachyOS lease image for a Crabbox `containerd`
+            lease: the k3s control-plane `pod-crabbox-k3s` contract plus the NVIDIA
+            userspace stack. Composes `opencharly/layer-nvidia` for
+            `nvidia-container-toolkit` (`nvidia-ctk`, `nvidia-cdi-hook`, and the
+            `nvidia-cdi-refresh.path`/`.service` pair) and the Arch driver
+            userspace from `nvidia-utils` (`nvidia-smi`, `/usr/lib/libnvidia-ml.so.1`).
+            The toolkit's own refresh unit is kept enabled inside the lease so
+            `/var/run/cdi/nvidia.yaml` is regenerated rather than snapshotted — a
+            one-shot `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` is the
+            stale form CONTAINERD.md §14.2 rejects — and a lease-owned drop-in clears
+            the vendor unit's `ExecCondition`, which greps a kernel module tree a
+            container does not carry. Ships the NVIDIA device plugin `v0.20.1` as a
+            k3s auto-applied DaemonSet with `DEVICE_LIST_STRATEGY=cdi-cri`,
+            `NVIDIA_DRIVER_ROOT=/` and `NVIDIA_CDI_HOOK_PATH=/usr/bin/nvidia-cdi-hook`,
+            so a pod that asks for `limits: nvidia.com/gpu: 1` is allocated a CDI
+            device and injected without a `runtimeClassName`. The cluster behaviour
+            is a deploy-context claim: `charly check box` proves the artifacts in the
+            image, not a running node.
+        base: ghcr.io/opencharly/pod-crabbox-k3s:2026.309.0459
+        # An OCI base does not inherit the parent's distro/build values, so the
+        # CachyOS chain is declared here; the base image is itself CachyOS.
+        distro:
+            - cachyos
+            - arch
+        # systemd refuses to run in system mode as a non-root PID 1, so the image
+        # ends at USER root exactly as the base image does; the LOGIN user stays
+        # `crabbox` (uid 1000), created by the inherited candy.
+        user: root
+        uid: 0
+        gid: 0
+        # systemd as PID 1, inherited from the base image.
+        entrypoint:
+            - /sbin/init
+        candy:
+            - nvidia-gpu-lease

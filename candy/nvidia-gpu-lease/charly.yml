@@ -1,0 +1,331 @@
+# nvidia-gpu-lease — the NVIDIA GPU delta added by `pod-crabbox-k3s-gpu` on top
+# of the `pod-crabbox-k3s` lease contract.
+#
+# Sources:
+#   - CONTAINERD-IMAGES.md §2, the `pod-crabbox-k3s-gpu` row: `nvidia-container-toolkit`
+#     with the toolkit's OWN refresh unit enabled inside the lease so
+#     `/var/run/cdi/nvidia.yaml` is regenerated — not a one-shot
+#     `--output=/etc/cdi/nvidia.yaml`, which §1.5 rejects as the stale form — and the
+#     NVIDIA device plugin with `DEVICE_LIST_STRATEGY=cdi-cri`,
+#     `NVIDIA_DRIVER_ROOT=/`, `NVIDIA_CDI_HOOK_PATH=/usr/bin/nvidia-cdi-hook`, so a
+#     plain pod with `limits: nvidia.com/gpu: 1` gets the GPU without a
+#     `runtimeClassName`.
+#   - CONTAINERD.md §14.2: CDI is always on in containerd 2.x, the spec dirs are
+#     `/etc/cdi` and `/var/run/cdi`, and the toolkit's refresh unit is what keeps
+#     `/var/run/cdi` current (a driver version appears 115 times in the generated
+#     spec, so a snapshot breaks on the first driver upgrade).
+#   - opencharly/layer-nvidia's `nvidia` candy: `nvidia-container-toolkit` on every
+#     distro, `nvidia-utils` on the Arch family, the `LD_LIBRARY_PATH=/usr/lib64`
+#     export and the Vulkan ICD directory. Requiring it keeps ONE implementation of
+#     the GPU userspace instead of re-declaring its packages here.
+#   - opencharly/pod-crabbox-k3s for the inherited-contract probes this candy repeats
+#     at its own boundary.
+nvidia-gpu-lease:
+    candy:
+        description: |
+            The NVIDIA GPU delta for a CachyOS Crabbox k3s lease. Requires
+            `opencharly/layer-nvidia`, which installs `nvidia-container-toolkit`
+            (`nvidia-ctk`, `nvidia-cdi-hook`, and the `nvidia-cdi-refresh.path` /
+            `.service` pair the Arch package enables through its own
+            `multi-user.target.wants` links) and the Arch driver userspace from
+            `nvidia-utils` (`nvidia-smi`, `/usr/lib/libnvidia-ml.so.1`). Writes the
+            lease drop-in that clears the vendor refresh unit's `ExecCondition` — a
+            lease is a container, so it carries no `/lib/modules/<release>/modules.dep`
+            for the vendor's `nvidia.ko` grep to match and the unit would be skipped
+            — so the refresh runs at boot and regenerates `/var/run/cdi/nvidia.yaml`.
+            Writes the NVIDIA device plugin v0.20.1 DaemonSet into
+            `/var/lib/rancher/k3s/server/manifests/`, which k3s auto-applies, carrying
+            `DEVICE_LIST_STRATEGY=cdi-cri`, `NVIDIA_DRIVER_ROOT=/` and
+            `NVIDIA_CDI_HOOK_PATH=/usr/bin/nvidia-cdi-hook` so the plugin advertises
+            `nvidia.com/gpu` and hands containerd a CDI device id for the allocation.
+        require:
+            # The canonical GPU userspace: nvidia-container-toolkit everywhere,
+            # nvidia-utils on the Arch family (this image), and the Vulkan ICD wiring.
+            - '@github.com/opencharly/layer-nvidia:v2026.296.0940'
+        # The lease SSH port is the base image's own contract. An OCI base does not
+        # carry its candy chain's ports across the boundary, so the published number
+        # is restated here (one number, taken from the base image's label).
+        port:
+            - 2222
+        plan:
+            # ------------------------------------------------------------------
+            # The toolkit's refresh unit, made runnable inside a lease.
+            #
+            # The Arch package already ENABLES the unit through its own vendor
+            # symlinks (/usr/lib/systemd/system/multi-user.target.wants/...), so the
+            # image adds no `enable` step of its own — re-linking it here would be a
+            # second copy of the package's work. What a lease must supply is the one
+            # condition a container cannot satisfy.
+            # ------------------------------------------------------------------
+            - run: write the drop-in that lets the toolkit's CDI refresh run inside a lease
+              id: nvidia-cdi-refresh-dropin
+              write: /etc/systemd/system/nvidia-cdi-refresh.service.d/20-crabbox-lease.conf
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s-gpu candy.
+                #
+                # CONTAINERD-IMAGES.md §2, the pod-crabbox-k3s-gpu row: the toolkit's
+                # own refresh unit is what keeps /var/run/cdi/nvidia.yaml current — a
+                # one-shot `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` is a
+                # snapshot that goes stale on the first driver upgrade
+                # (CONTAINERD.md §14.2).
+                #
+                # The vendor unit gates on
+                #   ExecCondition=/bin/sh -c '/usr/bin/grep -qE "/(nvidia|nvidia-current)[.]ko"
+                #     /lib/modules/%v/modules.dep || [ -e /dev/dxg ]'
+                # A lease is a container: it runs the HOST kernel and carries no
+                # /lib/modules/<release> tree of its own, so that grep can never match
+                # and systemd SKIPS the unit (a failing ExecCondition is a skip, not a
+                # failure) — leaving no CDI spec at all. The device nodes and the driver
+                # userspace reach the lease by other means, so the module-tree probe is
+                # the wrong gate here.
+                #
+                # `ExecCondition=` with an empty value resets the list
+                # (systemd.unit(5), "if the empty string is assigned ... the list of
+                # commands is reset"), which removes the vendor condition without
+                # copying and re-owning the vendor unit.
+                [Service]
+                ExecCondition=
+            # ------------------------------------------------------------------
+            # The NVIDIA device plugin, as a manifest k3s reconciles itself.
+            #
+            # k3s applies every manifest under <data-dir>/server/manifests at startup
+            # and on change, so the plugin ships IN the image instead of being a
+            # post-boot `kubectl apply` the consumer would have to know about.
+            # ------------------------------------------------------------------
+            - run: create the k3s auto-applied manifest directory
+              mkdir: /var/lib/rancher/k3s/server/manifests
+              run_as: root
+              mode: "0755"
+            - run: write the NVIDIA device plugin DaemonSet
+              id: nvidia-device-plugin-manifest
+              write: /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s-gpu candy.
+                #
+                # CONTAINERD-IMAGES.md §2, the pod-crabbox-k3s-gpu row. The plugin
+                # advertises `nvidia.com/gpu` and, with DEVICE_LIST_STRATEGY=cdi-cri,
+                # hands containerd the allocated CDI device id through the CRI's
+                # CDIDevices field — so a workload pod needs no `runtimeClassName`.
+                #
+                # The env vars are the row's, and each is a real k8s-device-plugin
+                # v0.20.1 option: DEVICE_LIST_STRATEGY (--device-list-strategy),
+                # NVIDIA_DRIVER_ROOT (--nvidia-driver-root) and NVIDIA_CDI_HOOK_PATH
+                # (--nvidia-cdi-hook-path).
+                #
+                # The driver-root volume is upstream's own mechanism for resolving
+                # NVML and the device nodes from the lease root: the plugin loads
+                # /driver-root/usr/lib/libnvidia-ml.so.1 and, because /driver-root/dev
+                # exists, resolves the device root to /driver-root as well. It is the
+                # same hostPath mount the upstream chart performs when
+                # `nvidiaDriverRoot` is a path (its default `/`).
+                #
+                # The cdi-root volume is the toolkit's refreshed spec directory, the
+                # only one the client may rely on (CONTAINERD.md §14.2).
+                apiVersion: apps/v1
+                kind: DaemonSet
+                metadata:
+                  name: nvidia-device-plugin-daemonset
+                  namespace: kube-system
+                  labels:
+                    app.kubernetes.io/name: nvidia-device-plugin
+                spec:
+                  selector:
+                    matchLabels:
+                      app.kubernetes.io/name: nvidia-device-plugin
+                  updateStrategy:
+                    type: RollingUpdate
+                  template:
+                    metadata:
+                      labels:
+                        app.kubernetes.io/name: nvidia-device-plugin
+                    spec:
+                      priorityClassName: system-node-critical
+                      nodeSelector:
+                        kubernetes.io/os: linux
+                      tolerations:
+                        - key: nvidia.com/gpu
+                          operator: Exists
+                          effect: NoSchedule
+                      containers:
+                        - name: nvidia-device-plugin-ctr
+                          image: nvcr.io/nvidia/k8s-device-plugin:v0.20.1
+                          env:
+                            - name: DEVICE_LIST_STRATEGY
+                              value: cdi-cri
+                            - name: NVIDIA_DRIVER_ROOT
+                              value: "/"
+                            - name: NVIDIA_CDI_HOOK_PATH
+                              value: /usr/bin/nvidia-cdi-hook
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: kubelet-device-plugins-dir
+                              mountPath: /var/lib/kubelet/device-plugins
+                            - name: driver-root
+                              mountPath: /driver-root
+                              readOnly: true
+                            - name: cdi-root
+                              mountPath: /var/run/cdi
+                              readOnly: true
+                      volumes:
+                        - name: kubelet-device-plugins-dir
+                          hostPath:
+                            path: /var/lib/kubelet/device-plugins
+                            type: Directory
+                        - name: driver-root
+                          hostPath:
+                            path: /
+                            type: Directory
+                        - name: cdi-root
+                          hostPath:
+                            path: /var/run/cdi
+                            type: DirectoryOrCreate
+            # ------------------------------------------------------------------
+            # The NVIDIA artifact surface, probed at THIS image's boundary.
+            # ------------------------------------------------------------------
+            - check: nvidia-container-toolkit is installed for CDI device generation
+              id: gpu-nvidia-container-toolkit
+              package:
+                  package: nvidia-container-toolkit
+                  installed: true
+            - check: the nvidia-ctk CLI lands on the canonical /usr/bin path
+              id: gpu-nvidia-ctk
+              file:
+                  file: /usr/bin/nvidia-ctk
+                  exists: true
+            - check: nvidia-ctk runs and reports a version number
+              id: gpu-nvidia-ctk-version
+              exit_status: 0
+              stdout:
+                  - matches: "[0-9]+\\.[0-9]+"
+              command: nvidia-ctk --version
+            - check: the CDI hook the device plugin is told to name is installed at that exact path
+              id: gpu-nvidia-cdi-hook
+              file:
+                  file: /usr/bin/nvidia-cdi-hook
+                  exists: true
+                  mode: "0755"
+            - check: nvidia-utils is installed for the driver userspace and NVML
+              id: gpu-nvidia-utils
+              package:
+                  package: nvidia-utils
+                  installed: true
+            - check: nvidia-smi is installed by the driver userspace
+              id: gpu-nvidia-smi
+              file:
+                  file: /usr/bin/nvidia-smi
+                  exists: true
+            - check: the NVML library the toolkit and the device plugin read is present
+              id: gpu-nvml-library
+              file:
+                  file: /usr/lib/libnvidia-ml.so.1
+                  exists: true
+            # ------------------------------------------------------------------
+            # The refresh unit: present, enabled by the package, and unblocked.
+            # ------------------------------------------------------------------
+            - check: the toolkit ships its CDI refresh path unit
+              id: gpu-refresh-path-unit
+              file:
+                  file: /usr/lib/systemd/system/nvidia-cdi-refresh.path
+                  exists: true
+            - check: the toolkit ships its CDI refresh service unit
+              id: gpu-refresh-service-unit
+              file:
+                  file: /usr/lib/systemd/system/nvidia-cdi-refresh.service
+                  exists: true
+            - check: the package's own vendor link enables the refresh path at boot
+              id: gpu-refresh-path-enabled
+              exit_status: 0
+              command: >-
+                  test "$(readlink /usr/lib/systemd/system/multi-user.target.wants/nvidia-cdi-refresh.path)" = ../nvidia-cdi-refresh.path
+            - check: the package's own vendor link enables the refresh service at boot
+              id: gpu-refresh-service-enabled
+              exit_status: 0
+              command: >-
+                  test "$(readlink /usr/lib/systemd/system/multi-user.target.wants/nvidia-cdi-refresh.service)" = ../nvidia-cdi-refresh.service
+            - check: the lease drop-in clears the vendor ExecCondition that a container cannot satisfy
+              id: gpu-refresh-dropin
+              exit_status: 0
+              command: >-
+                  grep -qx 'ExecCondition=' /etc/systemd/system/nvidia-cdi-refresh.service.d/20-crabbox-lease.conf
+            - check: the refresh service regenerates the spec at the path the device plugin reads
+              id: gpu-refresh-output-path
+              exit_status: 0
+              command: >-
+                  grep -qx 'Environment=NVIDIA_CTK_CDI_OUTPUT_FILE_PATH=/var/run/cdi/nvidia.yaml' /usr/lib/systemd/system/nvidia-cdi-refresh.service
+            # ------------------------------------------------------------------
+            # The device plugin manifest, probed value by value.
+            # ------------------------------------------------------------------
+            - check: the device plugin DaemonSet is in the directory k3s auto-applies
+              id: gpu-device-plugin-manifest
+              file:
+                  file: /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+                  exists: true
+            - check: the manifest pins the NVIDIA device plugin v0.20.1
+              id: gpu-device-plugin-image
+              exit_status: 0
+              command: >-
+                  grep -qE '^[[:space:]]*image: nvcr.io/nvidia/k8s-device-plugin:v0.20.1$' /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+            - check: the plugin is told to allocate through the CRI's CDI field
+              id: gpu-device-plugin-cdi-cri
+              exit_status: 0
+              command: >-
+                  awk '/^[[:space:]]*- name: DEVICE_LIST_STRATEGY$/{getline; if ($0 ~ /^[[:space:]]*value: cdi-cri$/) found=1} END{exit !found}' /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+            - check: the plugin is told the driver root is the lease root
+              id: gpu-device-plugin-driver-root
+              exit_status: 0
+              command: >-
+                  awk '/^[[:space:]]*- name: NVIDIA_DRIVER_ROOT$/{getline; if ($0 ~ /^[[:space:]]*value: "\/"$/) found=1} END{exit !found}' /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+            - check: the plugin is told the CDI hook path the image installs
+              id: gpu-device-plugin-hook-path
+              exit_status: 0
+              command: >-
+                  awk '/^[[:space:]]*- name: NVIDIA_CDI_HOOK_PATH$/{getline; if ($0 ~ /^[[:space:]]*value: \/usr\/bin\/nvidia-cdi-hook$/) found=1} END{exit !found}' /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+            - check: the plugin mounts the refreshed CDI spec directory
+              id: gpu-device-plugin-cdi-mount
+              exit_status: 0
+              command: >-
+                  grep -qE '^[[:space:]]*path: /var/run/cdi$' /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+            - check: the plugin mounts the kubelet device-plugin socket directory
+              id: gpu-device-plugin-socket-mount
+              exit_status: 0
+              command: >-
+                  grep -qE '^[[:space:]]*path: /var/lib/kubelet/device-plugins$' /var/lib/rancher/k3s/server/manifests/nvidia-device-plugin.yaml
+            # ------------------------------------------------------------------
+            # The inherited k3s and lease contract, probed at THIS image's boundary.
+            # ------------------------------------------------------------------
+            - check: the inherited k3s binary is installed
+              id: gpu-k3s-binary
+              exit_status: 0
+              command: test -x /usr/local/bin/k3s
+            - check: the inherited k3s config points at the inner containerd socket
+              id: gpu-k3s-endpoint
+              exit_status: 0
+              command: >-
+                  grep -qx 'container-runtime-endpoint: unix:///run/containerd/containerd.sock' /etc/rancher/k3s/config.yaml
+            - check: the inherited k3s unit is enabled at boot
+              id: gpu-k3s-unit-enabled
+              exit_status: 0
+              command: test "$(readlink /etc/systemd/system/multi-user.target.wants/k3s.service)" = /etc/systemd/system/k3s.service
+            - check: /sbin/init resolves to the systemd binary, so the image can boot systemd as PID 1
+              id: gpu-systemd-init-binary
+              exit_status: 0
+              command: test "$(readlink -f /sbin/init)" = /usr/lib/systemd/systemd
+            - check: the inherited lease SSH contract is present (sshd, bootstrap, readiness hook)
+              id: gpu-lease-binaries
+              exit_status: 0
+              command: >-
+                  test -x /usr/sbin/sshd &&
+                  test -x /usr/local/libexec/crabbox/bootstrap.sh &&
+                  test -x /usr/local/libexec/crabbox/ready
+            - check: the inherited lease login user is crabbox at uid 1000
+              id: gpu-lease-user
+              exit_status: 0
+              command: >-
+                  test "$(getent passwd 1000 | cut -d: -f1)" = crabbox
